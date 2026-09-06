@@ -1,0 +1,16 @@
+.{
+    .name = .zancudo,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.14.0",
+    .fingerprint = 0x97eb65f4749bd35f,
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "test_all.zig",
+        "src",
+        "tests",
+        "fuzz",
+        "README.md",
+    },
+}

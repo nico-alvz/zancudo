@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.14.1
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.14.1
+
+      - name: zig fmt (check)
+        run: zig fmt --check .
+
+      - name: Build
+        run: zig build
+
+      - name: Unit + integration tests
+        run: zig build test --summary all
+
+      - name: Build fuzz harness
+        run: zig build fuzz
+
+      - name: Fuzz smoke run (randomized frames, no corpus)
+        run: ./zig-out/bin/fuzz-decoder < /dev/null
