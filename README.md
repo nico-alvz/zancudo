@@ -1,6 +1,6 @@
-# zancudo
+# zancudo-mqtt
 
-[![CI](https://github.com/nico-alvz/zancudo/actions/workflows/ci.yml/badge.svg)](https://github.com/nico-alvz/zancudo/actions/workflows/ci.yml)
+[![CI](https://github.com/nico-alvz/zancudo-mqtt/actions/workflows/ci.yml/badge.svg)](https://github.com/nico-alvz/zancudo-mqtt/actions/workflows/ci.yml)
 
 An ultra-high-performance, strict-security **MQTT broker written in Zig**,
 wire-compatible with **MQTT v3.1.1 and v5.0**.
@@ -14,13 +14,14 @@ readiness loop that cannot use the newest kernel I/O interfaces.
 | Concern | Approach | Where |
 | --- | --- | --- |
 | Per-session memory | An **arena allocator per connection**; the whole region is freed in one call on disconnect. Zero hidden allocations on the data path. | `src/net/connection.zig`, `src/core/session.zig` |
-| Async I/O | A **kernel event-loop reactor**: `io_uring` on modern Linux (via `IORING_OP_POLL_ADD`), automatic **`epoll`** fallback, **`kqueue`** on BSD/macOS. | `src/io/reactor.zig`, `src/io/linux.zig`, `src/io/kqueue.zig` |
+| Async I/O | A **kernel event-loop reactor**: `io_uring` on modern Linux (`IORING_OP_POLL_ADD` for readiness, `IORING_OP_TIMEOUT` for bounded waits), automatic **`epoll`** fallback, **`kqueue`** on BSD/macOS. | `src/io/reactor.zig`, `src/io/linux.zig`, `src/io/kqueue.zig` |
 | Network → router hand-off | A **bounded lock-free MPMC queue** (Vyukov algorithm). No mutex on the data path. | `src/core/lockfree.zig` |
 | Topic routing | A **cache-oriented radix tree** keyed by topic *level*; exact children in a contiguous segment-sorted array (binary search), dedicated `+` / `#` slots. Reserved-topic (`$SYS`) rules enforced. | `src/core/radix_tree.zig` |
+| QoS 1 / 2 | Full handshakes both directions: inbound PUBLISH→PUBREC→PUBREL→PUBCOMP with **DUP dedup** on packet id; outbound per-session packet-id allocation, an inflight state machine, and back-pressure when the window fills. | `src/core/session.zig`, `src/core/router.zig`, `src/broker.zig` |
 | Protocol constants / parsing | `comptime` enums, fixed-header masks, property table, and a `comptime` varint length function. | `src/protocol/mqtt.zig`, `src/protocol/varint.zig` |
 | Packet decoding | A single bounds-checked `Reader` choke point; every network length is checked against `src/security/limits.zig` before a byte is copied. Returns structured errors, never panics. | `src/protocol/reader.zig`, `src/protocol/decoder.zig` |
-| Persistence | A lightweight **`mmap` write-ahead log** (append-only, CRC-per-record) for retained messages and QoS 1/2 session state. | `src/persist/wal.zig` |
-| Resilience | **Local-first mesh** scaffold: shard ownership by first topic level, `ownsLocally()` gate, hooks for gossip + automatic shard re-homing on node death. Single-node today. | `src/cluster/mesh.zig` |
+| Persistence | A lightweight **`mmap` write-ahead log** (append-only, CRC-per-record) for retained messages, session snapshots and inflight QoS 1/2 publishes. | `src/persist/wal.zig` |
+| Resilience | **Local-first mesh**: shards keyed by first topic level, ownership by **rendezvous hashing (HRW)** over the alive set (minimal reshuffle on membership change), a time-based `alive→suspect→dead` failure detector, and a monotonic `epoch` bumped on every transition. Gossip *transport* is the remaining `TODO`; single-node works because the layer short-circuits when disabled. | `src/cluster/mesh.zig` |
 | Fuzzing | Harness targeting frame decoding: no out-of-bounds read, no panic, decoder/encoder round-trip agreement. | `fuzz/fuzz_decoder.zig` |
 
 ## Directory layout
@@ -48,12 +49,12 @@ src/
   core/
     lockfree.zig     bounded lock-free queue
     radix_tree.zig   topic radix tree with + / # matching
-    session.zig      session state, subscriptions, inflight window
+    session.zig      session state, subscriptions, QoS 1/2 inflight machine
     router.zig       single-threaded central router
   persist/
     wal.zig          mmap append-only write-ahead log
   cluster/
-    mesh.zig         local-first mesh layer (scaffold)
+    mesh.zig         local-first mesh: HRW ownership + failure detector
   security/
     limits.zig       hard, comptime buffer limits enforced by the decoder
 tests/               unit + integration tests (zig build test)
@@ -85,12 +86,19 @@ returned error, never a trap.
 
 ## Status
 
-Implemented and tested: protocol constants, varint, bounds-checked reader,
-frame decoder/encoder, radix tree (with the OASIS wildcard examples), lock-free
-queue (incl. a concurrent producer test), session bookkeeping, the WAL, and the
-router fan-out. The reactor loop and broker wiring compile and run as a
-single-threaded server. Mesh gossip/transport and full QoS 2 flow persistence
-are marked `TODO` in-source.
+Implemented and tested (`zig build test`): protocol constants, varint, the
+bounds-checked reader, frame decoder/encoder, radix tree (OASIS wildcard
+examples), lock-free queue (with a concurrent-producer test), session
+bookkeeping, the full QoS 1/2 flows in both directions, the WAL, the router
+fan-out, and the mesh HRW-ownership + failure-detector logic. A load test
+drives many concurrent publishers through one router and an adversarial test
+sprays malformed frames at the decoder. The reactor loop and broker wiring
+compile and run as a single-threaded server; a loopback check exercises
+CONNECT/SUBSCRIBE/PUBLISH and the QoS 2 handshake end to end.
+
+Remaining `TODO` in-source: the mesh **gossip transport** (heartbeats +
+retained/subscription deltas over a socket) and **WAL replay** to rehydrate a
+persistent session's inflight window after a restart.
 
 ## License
 
