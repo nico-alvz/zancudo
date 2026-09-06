@@ -19,8 +19,12 @@ test {
     _ = @import("src/cluster/mesh.zig");
     _ = @import("src/config.zig");
     _ = @import("tests/radix_tree_test.zig");
+    _ = @import("tests/qos_test.zig");
+    _ = @import("tests/stress_test.zig");
 
     std.testing.refAllDeclsRecursive(@import("src/core/radix_tree.zig"));
     std.testing.refAllDeclsRecursive(@import("src/protocol/decoder.zig"));
     std.testing.refAllDeclsRecursive(@import("src/protocol/encoder.zig"));
+    std.testing.refAllDeclsRecursive(@import("src/cluster/mesh.zig"));
+    std.testing.refAllDeclsRecursive(@import("src/core/router.zig"));
 }
