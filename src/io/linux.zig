@@ -156,10 +156,23 @@ pub const LinuxReactor = struct {
         return self.events_out[0..out];
     }
 
+    /// user_data slot for the internal IORING_OP_TIMEOUT completion. fds are
+    /// small non-negative ints, so the max u64 can never collide with one.
+    const timeout_user_data: u64 = std.math.maxInt(u64);
+
     fn pollUring(self: *LinuxReactor, r: *linux.IoUring, timeout_ms: i32) ![]const Event {
-        // Submit any pending re-arms and wait for at least one completion.
-        // A bounded wait is expressed with an IORING_OP_TIMEOUT SQE; omitted
-        // here for brevity, so `timeout_ms` only gates whether we block at all.
+        // Bound the wait with an IORING_OP_TIMEOUT SQE: it posts its own CQE
+        // when the timespec elapses, so `submit_and_wait(1)` returns after
+        // `timeout_ms` even if no socket became ready.
+        var ts: linux.kernel_timespec = .{ .sec = 0, .nsec = 0 };
+        var timer_armed = false;
+        if (timeout_ms > 0) {
+            ts.sec = @divFloor(timeout_ms, 1000);
+            ts.nsec = @as(i64, @rem(timeout_ms, 1000)) * std.time.ns_per_ms;
+            if (r.timeout(timeout_user_data, &ts, 0, 0)) |_| {
+                timer_armed = true;
+            } else |_| {}
+        }
         const wait_nr: u32 = if (timeout_ms == 0) 0 else 1;
         _ = r.submit_and_wait(wait_nr) catch |e| switch (e) {
             error.SignalInterrupt => return self.events_out[0..0],
@@ -169,6 +182,10 @@ pub const LinuxReactor = struct {
         const count = try r.copy_cqes(self.cqes, 0);
         var out: usize = 0;
         for (self.cqes[0..count]) |cqe| {
+            if (cqe.user_data == timeout_user_data) {
+                timer_armed = false; // it fired; nothing to cancel
+                continue;
+            }
             const fd = user_data_fd(cqe.user_data);
             const entry = self.armed.get(fd) orelse continue;
             const revents: u32 = if (cqe.res < 0) 0 else @intCast(cqe.res);
@@ -185,6 +202,9 @@ pub const LinuxReactor = struct {
                 _ = r.poll_add(cqe.user_data, fd, pollMask(entry.interest)) catch {};
             }
         }
+        // A socket woke us before the timer expired: cancel the stale timeout so
+        // it does not accumulate in the ring across rapid poll() calls.
+        if (timer_armed) _ = r.timeout_remove(0, timeout_user_data, 0) catch {};
         _ = r.submit() catch {};
         return self.events_out[0..out];
     }
