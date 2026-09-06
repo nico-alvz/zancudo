@@ -30,6 +30,19 @@ const limits = @import("security/limits.zig");
 
 const listener_token: u64 = std.math.maxInt(u64);
 
+/// Build a router `publish` command from a decoded inbound PUBLISH. The topic
+/// and payload slices alias the connection's receive buffer and stay valid
+/// until the router drains the queue in the same reactor iteration.
+fn fwd(from: u64, p: decoder.Publish) router_mod.PublishCmd {
+    return .{
+        .from = from,
+        .topic = p.topic,
+        .qos = p.qos,
+        .retain = p.retain,
+        .payload = p.payload,
+    };
+}
+
 pub const Broker = struct {
     gpa: Allocator,
     cfg: Config,
@@ -167,9 +180,21 @@ pub const Broker = struct {
             const c = maybe orelse continue;
             const sess = c.session_id orelse continue;
             if (sess != d.to) continue;
+
             var buf: [limits.max_packet_len]u8 = undefined;
-            const pid: ?u16 = if (d.qos == .at_most_once) null else 1;
-            const frame = encoder.publish(&buf, c.version, d.topic, d.qos, d.retain, false, pid, d.payload) catch return;
+            const frame = switch (d.kind) {
+                .pubrel => encoder.packetIdAck(&buf, .pubrel, d.packet_id.?) catch return,
+                .publish => encoder.publish(
+                    &buf,
+                    c.version,
+                    d.topic,
+                    d.qos,
+                    d.retain,
+                    false,
+                    d.packet_id,
+                    d.payload,
+                ) catch return,
+            };
             c.queueOut(frame) catch return;
             _ = c.flush() catch {};
             if (c.tx.items.len > 0)
@@ -232,21 +257,28 @@ pub const Broker = struct {
             },
             .publish => {
                 const p = try decoder.parsePublish(frame.flags, frame.body, conn.version);
-                if (conn.session_id) |sid| {
-                    _ = self.queue.tryPush(.{ .publish = .{
-                        .from = sid,
-                        .topic = p.topic,
-                        .qos = p.qos,
-                        .retain = p.retain,
-                        .payload = p.payload,
-                    } });
-                }
-                if (p.qos == .at_least_once) {
-                    const ack = try encoder.packetIdAck(&scratch, .puback, p.packet_id.?);
-                    try conn.queueOut(ack);
-                } else if (p.qos == .exactly_once) {
-                    const ack = try encoder.packetIdAck(&scratch, .pubrec, p.packet_id.?);
-                    try conn.queueOut(ack);
+                const sid = conn.session_id orelse return error.ProtocolViolation;
+
+                switch (p.qos) {
+                    .at_most_once => {
+                        _ = self.queue.tryPush(.{ .publish = fwd(sid, p) });
+                    },
+                    .at_least_once => {
+                        _ = self.queue.tryPush(.{ .publish = fwd(sid, p) });
+                        const ack = try encoder.packetIdAck(&scratch, .puback, p.packet_id.?);
+                        try conn.queueOut(ack);
+                    },
+                    .exactly_once => {
+                        // Deliver at most once even if the client retransmits
+                        // the PUBLISH before its PUBREL: dedup on packet id.
+                        const pid = p.packet_id.?;
+                        const gop = try conn.qos2_rx.getOrPut(self.gpa, pid);
+                        if (!gop.found_existing) {
+                            _ = self.queue.tryPush(.{ .publish = fwd(sid, p) });
+                        }
+                        const ack = try encoder.packetIdAck(&scratch, .pubrec, pid);
+                        try conn.queueOut(ack);
+                    },
                 }
             },
             .subscribe => {
@@ -286,12 +318,25 @@ pub const Broker = struct {
                 try conn.queueOut(pong);
             },
             .pubrel => {
-                var r = @import("protocol/reader.zig").Reader.init(frame.body);
-                const pid = try r.u16be();
+                // QoS 2 step 3->4 for an inbound message: release the dedup
+                // entry and confirm with PUBCOMP.
+                const pid = try decoder.parsePacketId(frame.body);
+                _ = conn.qos2_rx.remove(pid);
                 const ack = try encoder.packetIdAck(&scratch, .pubcomp, pid);
                 try conn.queueOut(ack);
             },
-            .puback, .pubrec, .pubcomp => {}, // inflight tracking updates go here
+            .puback => {
+                if (conn.session_id) |sid|
+                    _ = self.queue.tryPush(.{ .pub_ack = .{ .id = sid, .packet_id = try decoder.parsePacketId(frame.body) } });
+            },
+            .pubrec => {
+                if (conn.session_id) |sid|
+                    _ = self.queue.tryPush(.{ .pub_rec = .{ .id = sid, .packet_id = try decoder.parsePacketId(frame.body) } });
+            },
+            .pubcomp => {
+                if (conn.session_id) |sid|
+                    _ = self.queue.tryPush(.{ .pub_comp = .{ .id = sid, .packet_id = try decoder.parsePacketId(frame.body) } });
+            },
             .disconnect => {
                 conn.state = .draining;
                 if (conn.session_id) |sid|

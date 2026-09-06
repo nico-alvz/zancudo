@@ -216,6 +216,16 @@ pub fn parseSubscribe(body: []const u8, version: mqtt.ProtocolLevel) Error!Subsc
     return .{ .reader = r, .packet_id = packet_id, .version = version };
 }
 
+/// PUBACK / PUBREC / PUBREL / PUBCOMP body: a 2-byte packet id, optionally
+/// followed (v5) by a reason code and a property block, both of which we accept
+/// but do not need here.
+pub fn parsePacketId(body: []const u8) Error!u16 {
+    var r = Reader.init(body);
+    const pid = try r.u16be();
+    if (pid == 0) return Error.ProtocolViolation;
+    return pid;
+}
+
 /// Read the v5 property block: a varint byte-count followed by that many bytes.
 /// We validate the framing (so a lie about the length is caught here) and skip
 /// the contents; individual property interpretation lives in higher layers.

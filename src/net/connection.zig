@@ -44,6 +44,11 @@ pub const Connection = struct {
     /// Pending outbound bytes (CONNACK/PUBLISH/...) not yet written to the socket.
     tx: std.ArrayListUnmanaged(u8) = .{},
 
+    /// Packet ids of inbound QoS 2 PUBLISHes we have accepted a PUBREC for but
+    /// not yet seen the matching PUBREL. Lets us drop a DUP retransmit instead
+    /// of delivering the message twice (MQTT-4.3.3). Keyed on `gpa`.
+    qos2_rx: std.AutoHashMapUnmanaged(u16, void) = .{},
+
     peer: std.net.Address = undefined,
     connected_at_ms: i64 = 0,
     last_activity_ms: i64 = 0,
@@ -69,6 +74,7 @@ pub const Connection = struct {
 
     pub fn deinit(self: *Connection, gpa: Allocator) void {
         self.tx.deinit(self.arena.allocator());
+        self.qos2_rx.deinit(gpa);
         gpa.free(self.rx);
         // Single call releases every session allocation at once.
         self.arena.deinit();

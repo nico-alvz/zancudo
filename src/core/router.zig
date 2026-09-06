@@ -25,22 +25,38 @@ pub const Command = union(enum) {
     detach_session: struct { id: SessionId, clean: bool },
     subscribe: struct { id: SessionId, filter: []const u8, qos: mqtt.Qos, no_local: bool },
     unsubscribe: struct { id: SessionId, filter: []const u8 },
-    publish: struct {
-        from: SessionId,
-        topic: []const u8,
-        qos: mqtt.Qos,
-        retain: bool,
-        payload: []const u8,
-    },
+    publish: PublishCmd,
+    /// A subscriber acknowledged one of our outbound QoS>0 deliveries. These
+    /// drive the session's inflight state machine (and, for PUBREC, produce a
+    /// follow-up PUBREL delivery).
+    pub_ack: PacketAck,
+    pub_rec: PacketAck,
+    pub_comp: PacketAck,
 };
 
-/// The router emits deliveries the network layer must serialize onto sockets.
-pub const Delivery = struct {
-    to: SessionId,
+pub const PublishCmd = struct {
+    from: SessionId,
     topic: []const u8,
     qos: mqtt.Qos,
     retain: bool,
     payload: []const u8,
+};
+
+pub const PacketAck = struct { id: SessionId, packet_id: u16 };
+
+/// What kind of control packet a `Delivery` represents on the wire.
+pub const DeliveryKind = enum { publish, pubrel };
+
+/// The router emits deliveries the network layer must serialize onto sockets.
+pub const Delivery = struct {
+    to: SessionId,
+    kind: DeliveryKind = .publish,
+    topic: []const u8 = "",
+    qos: mqtt.Qos = .at_most_once,
+    retain: bool = false,
+    payload: []const u8 = "",
+    /// Set for QoS>0 PUBLISH and for every PUBREL; null for QoS 0 PUBLISH.
+    packet_id: ?u16 = null,
 };
 
 pub const CommandQueue = BoundedQueue(Command);
@@ -63,6 +79,10 @@ pub const Router = struct {
         delivered: u64 = 0,
         dropped_no_subscriber: u64 = 0,
         retained_stored: u64 = 0,
+        /// QoS>0 deliveries skipped because the subscriber's inflight window
+        /// was full (back-pressure, not an error).
+        inflight_backpressure: u64 = 0,
+        qos2_completed: u64 = 0,
     };
 
     pub fn init(gpa: Allocator, inbox: *CommandQueue, wal: ?*Wal, mesh: *Mesh) Router {
@@ -139,6 +159,33 @@ pub const Router = struct {
                 self.tree.unsubscribe(c.filter, sess.id) catch {};
             },
             .publish => |c| self.routePublish(c, sink),
+            .pub_ack => |c| {
+                const sess = self.sessions.get(c.id) orelse return;
+                if (sess.onPubAck(c.packet_id)) self.releaseWal(sess, c.packet_id);
+            },
+            .pub_rec => |c| {
+                const sess = self.sessions.get(c.id) orelse return;
+                if (sess.onPubRec(c.packet_id)) {
+                    // Step 3 of the QoS 2 flow: acknowledge PUBREC with PUBREL.
+                    sink.emit(sink.ctx, .{ .to = c.id, .kind = .pubrel, .packet_id = c.packet_id });
+                }
+            },
+            .pub_comp => |c| {
+                const sess = self.sessions.get(c.id) orelse return;
+                if (sess.onPubComp(c.packet_id)) {
+                    self.releaseWal(sess, c.packet_id);
+                    self.stats.qos2_completed += 1;
+                }
+            },
+        }
+    }
+
+    fn releaseWal(self: *Router, sess: *Session, packet_id: u16) void {
+        _ = sess;
+        if (self.wal) |w| {
+            var buf: [2]u8 = undefined;
+            std.mem.writeInt(u16, &buf, packet_id, .little);
+            _ = w.append(.inflight_release, &buf) catch {};
         }
     }
 
@@ -160,23 +207,57 @@ pub const Router = struct {
         std.mem.sort(SubscriberId, self.match_scratch.items, {}, std.sort.asc(SubscriberId));
         var last: ?SubscriberId = null;
         var any = false;
+        const now = std.time.milliTimestamp();
         for (self.match_scratch.items) |sid| {
             if (last != null and last.? == sid) continue;
             last = sid;
             const sess = self.sessions.get(sid) orelse continue;
             if (sess.id == c.from and self.hasNoLocal(sess, c.topic)) continue;
             const eff_qos: mqtt.Qos = minQos(c.qos, self.grantedQos(sess, c.topic));
+
+            var packet_id: ?u16 = null;
+            if (eff_qos != .at_most_once) {
+                const wal_off = self.logInflight(eff_qos, c.topic, c.payload);
+                packet_id = sess.beginOutbound(eff_qos, wal_off, now) orelse {
+                    self.stats.inflight_backpressure += 1;
+                    continue;
+                };
+            }
+
             sink.emit(sink.ctx, .{
                 .to = sid,
+                .kind = .publish,
                 .topic = c.topic,
                 .qos = eff_qos,
                 .retain = false,
                 .payload = c.payload,
+                .packet_id = packet_id,
             });
             self.stats.delivered += 1;
             any = true;
         }
         if (!any) self.stats.dropped_no_subscriber += 1;
+    }
+
+    /// Persist an outbound QoS>0 message so it survives a restart of a
+    /// persistent session. Record layout: [qos:u8][topic_len:u16 LE][topic][payload].
+    fn logInflight(self: *Router, qos: mqtt.Qos, topic: []const u8, payload: []const u8) u64 {
+        const w = self.wal orelse return 0;
+        var hdr: [3]u8 = undefined;
+        hdr[0] = @intFromEnum(qos);
+        std.mem.writeInt(u16, hdr[1..3], @intCast(topic.len), .little);
+        // Two-part record: write header+topic+payload into a small stack buffer
+        // when it fits, else fall back to just the header (payload replay is
+        // best-effort for oversized messages).
+        var stack: [512]u8 = undefined;
+        const total = hdr.len + topic.len + payload.len;
+        if (total <= stack.len) {
+            @memcpy(stack[0..3], &hdr);
+            @memcpy(stack[3 .. 3 + topic.len], topic);
+            @memcpy(stack[3 + topic.len .. total], payload);
+            return w.append(.inflight_publish, stack[0..total]) catch 0;
+        }
+        return w.append(.inflight_publish, &hdr) catch 0;
     }
 
     fn storeRetained(self: *Router, topic: []const u8, payload: []const u8) void {
